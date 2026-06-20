@@ -1,0 +1,204 @@
+/**
+ * # Firestore Security Rules for AgriWise
+ *
+ * ## Core Philosophy
+ * This ruleset enforces a strict security model that segregates public, read-only data from private, user-owned data. The primary goal is to ensure that farmers can only access and manage their own information (profiles and recommendations), while globally relevant agricultural data (commodities, price data) is available for consumption by all authenticated users but cannot be modified by them.
+ *
+ * ## Data Structure
+ * - `/farmers/{farmerId}`: A top-level collection where each document represents a single user's profile (farmer or service provider). The document ID `{farmerId}` MUST match the user's Authentication UID.
+ * - `/farmers/{farmerId}/recommendations/{recommendationId}`: A subcollection containing private, AI-generated recommendations for the parent farmer. Access is inherited from and restricted to the parent farmer.
+ * - `/farmers/{farmerId}/profitCalculations/{calculationId}`: A subcollection storing profit calculations for the parent farmer.
+ * - `/commodityCategories`, `/commodities`, `/priceData`, `/fuelPrices`: Top-level collections containing public reference data. These are readable by any authenticated user but are not writable from the client-side, protecting data integrity.
+ * - `/tenders/{tenderId}`: A top-level collection for all user-posted tenders. Readable by all, but only writable by the owner.
+ *
+ * ## Key Security Decisions
+ * - **Strict Ownership**: All data under the `/farmers/{farmerId}` path is strictly owned. Access is granted for get, update, and delete only if the requesting user's UID matches the `{farmerId}` in the path. For top-level collections like `/tenders`, ownership is verified by checking a `farmerId` field within the document.
+ * - **Controlled User Enumeration**: Listing the `/farmers` collection is allowed for authenticated users to enable the service provider directory. However, direct `get` access to another user's profile is still restricted to the owner, providing a layer of privacy.
+ * - **Client-Side Writes to Public Data are Disabled**: To ensure data integrity, the `commodityCategories`, `commodities`, `priceData`, and `fuelPrices` collections are read-only for clients. This data should be managed via a trusted backend environment (e.g., Cloud Functions, Admin SDK).
+ * - **Authorization Independence**: Rules are designed to be simple and performant. By nesting user-specific data, we use the document path for authorization (`request.auth.uid == farmerId`). For top-level user-owned content (e.g. tenders), we check an internal field (`request.auth.uid == resource.data.farmerId`). This avoids costly `get()` or `exists()` calls.
+ * - **Relational Integrity Validation**: On document creation, rules verify that internal ID fields (like `farmerId` on a Recommendation) match the ID in the document path or the creator's UID, ensuring data consistency. These IDs are immutable on update.
+ *
+ */
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    // Helper functions to promote readable, secure, and maintainable rules.
+    
+    /**
+     * Checks if the user is authenticated.
+     */
+    function isSignedIn() {
+      return request.auth != null;
+    }
+
+    /**
+     * Checks if the currently authenticated user's UID matches the provided userId.
+     * This is the primary function for enforcing data ownership via path.
+     */
+    function isOwner(userId) {
+      return isSignedIn() && request.auth.uid == userId;
+    }
+
+    /**
+     * Ensures an operation is performed by the owner on an existing document.
+     * CRITICAL: Prevents update/delete operations on non-existent documents.
+     */
+    function isExistingOwner(userId) {
+      return isOwner(userId) && resource != null;
+    }
+    
+    /**
+     * Validates that a user is creating their own Farmer profile and that the
+     * document's internal `id` field matches their UID for relational integrity.
+     */
+    function isCreatingSelf(userId) {
+      return isOwner(userId) && request.resource.data.id == userId;
+    }
+    
+    /**
+     * Validates that a user is updating their own Farmer profile and that the
+     * internal `id` field remains unchanged, preventing ownership transfer.
+     */
+    function isUpdatingSelf(userId) {
+      return isExistingOwner(userId) && request.resource.data.id == resource.data.id;
+    }
+
+    /**
+     * Validates that a user is creating a document within their own subcollection
+     * and that the document's internal `farmerId` field matches their UID.
+     */
+    function isCreatingOwnedDoc(userId) {
+      return isOwner(userId) && request.resource.data.farmerId == userId;
+    }
+    
+    /**
+     * Validates that a user is updating a document in their own subcollection
+     * and that the internal `farmerId` field remains unchanged.
+     */
+    function isUpdatingOwnedDoc(userId) {
+      return isExistingOwner(userId) && request.resource.data.farmerId == resource.data.farmerId;
+    }
+
+    /**
+     * @description Manages individual farmer and service provider profiles. A user can create, read, update, and delete their own profile.
+     * @path /farmers/{farmerId}
+     * @allow (get) A farmer with UID 'farmer123' reading their own document at `/farmers/farmer123`.
+     * @allow (list) Any authenticated user can list all documents to discover service providers.
+     * @deny (update) A farmer with UID 'farmer456' trying to modify the document at `/farmers/farmer123`.
+     * @principle Allows listing for service discovery but restricts direct access (`get`) and modification (`update`, `delete`) to the document owner.
+     */
+    match /farmers/{farmerId} {
+      allow get: if isOwner(farmerId);
+      allow list: if isSignedIn();
+      allow create: if isCreatingSelf(farmerId);
+      allow update: if isUpdatingSelf(farmerId);
+      allow delete: if isExistingOwner(farmerId);
+      
+      /**
+       * @description Manages a farmer's private recommendations. A farmer can read and manage their own recommendations.
+       * @path /farmers/{farmerId}/recommendations/{recommendationId}
+       * @allow (list) A farmer with UID 'farmer123' listing recommendations at `/farmers/farmer123/recommendations`.
+       * @allow (create) A farmer with UID 'farmer123' creating a new recommendation document in their own subcollection.
+       * @deny (get) A farmer with UID 'farmer456' trying to read a recommendation at `/farmers/farmer123/recommendations/rec_abc`.
+       * @principle Enforces document ownership for all operations on a user's private subcollection.
+       */
+      match /recommendations/{recommendationId} {
+        allow get: if isOwner(farmerId);
+        allow list: if isOwner(farmerId);
+        allow create: if isCreatingOwnedDoc(farmerId);
+        allow update: if isUpdatingOwnedDoc(farmerId);
+        allow delete: if isExistingOwner(farmerId);
+      }
+      
+      /**
+       * @description Manages a farmer's saved profit calculations.
+       * @path /farmers/{farmerId}/profitCalculations/{calculationId}
+       * @principle Enforces document ownership for all operations on a user's private subcollection.
+       */
+      match /profitCalculations/{calculationId} {
+        allow get: if isOwner(farmerId);
+        allow list: if isOwner(farmerId);
+        allow create: if isCreatingOwnedDoc(farmerId);
+        allow update: if isUpdatingOwnedDoc(farmerId);
+        allow delete: if isExistingOwner(farmerId);
+      }
+    }
+
+    /**
+     * @description Publicly readable collection of user-posted tenders.
+     * @path /tenders/{tenderId}
+     * @allow (list) Any authenticated user can list all tenders.
+     * @allow (create) Any authenticated user can create a tender, but must own it.
+     * @deny (update) A user trying to update a tender they do not own.
+     * @principle Provides public read access, but write and delete are restricted to the document owner via an internal `farmerId` field.
+     */
+    match /tenders/{tenderId} {
+      allow get, list: if isSignedIn();
+      allow create: if isSignedIn() && request.resource.data.farmerId == request.auth.uid;
+      allow update, delete: if isSignedIn() && request.auth.uid == resource.data.farmerId;
+    }
+
+    /**
+     * @description Defines categories for agricultural commodities. This is public reference data.
+     * @path /commodityCategories/{categoryId}
+     * @allow (get) Any authenticated user reading a category at `/commodityCategories/grains`.
+     * @deny (create) Any authenticated user attempting to create a new category document.
+     * @principle Provides public read access to signed-in users while protecting data integrity by disallowing client writes.
+     */
+    match /commodityCategories/{categoryId} {
+      allow get: if isSignedIn();
+      allow list: if isSignedIn();
+      allow create: if false;
+      allow update: if false;
+      allow delete: if false;
+    }
+
+    /**
+     * @description Defines specific agricultural commodities. This is public reference data.
+     * @path /commodities/{commodityId}
+     * @allow (list) Any authenticated user listing all available commodities.
+     * @deny (update) Any authenticated user attempting to modify a commodity document.
+     * @principle Provides public read access to signed-in users while protecting data integrity by disallowing client writes.
+     */
+    match /commodities/{commodityId} {
+      allow get: if isSignedIn();
+      allow list: if isSignedIn();
+      allow create: if false;
+      allow update: if false;
+      allow delete: if false;
+    }
+
+    /**
+     * @description Stores historical and real-time price data for commodities. This is public reference data.
+     * @path /priceData/{priceDataId}
+     * @allow (get) Any authenticated user reading a specific price record.
+     * @deny (delete) Any authenticated user attempting to delete a price record.
+     * @principle Provides public read access to signed-in users while protecting data integrity by disallowing client writes.
+     */
+    match /priceData/{priceDataId} {
+      allow get: if isSignedIn();
+      allow list: if isSignedIn();
+      allow create: if false;
+      allow update: if false;
+      allow delete: if false;
+    }
+
+    /**
+     * @description Stores current fuel price data. This is public reference data.
+     * @path /fuelPrices/{fuelPriceId}
+     * @allow (get) Any authenticated user reading a specific fuel price record.
+     * @deny (delete) Any authenticated user attempting to delete a price record.
+     * @principle Provides public read access to signed-in users while protecting data integrity by disallowing client writes.
+     */
+    match /fuelPrices/{fuelPriceId} {
+      allow get: if isSignedIn();
+      allow list: if isSignedIn();
+      allow create: if false;
+      allow update: if false;
+      allow delete: if false;
+    }
+  }
+}
+
+    
